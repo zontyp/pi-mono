@@ -1,6 +1,6 @@
 import { streamSimple, type ToolResultMessage, type Usage } from "@mariozechner/pi-ai";
 import { html, LitElement } from "lit";
-import { customElement, property, query } from "lit/decorators.js";
+import { property, query } from "lit/decorators.js";
 import { ModelSelector } from "../dialogs/ModelSelector.js";
 import type { MessageEditor } from "./MessageEditor.js";
 import "./MessageEditor.js";
@@ -16,7 +16,6 @@ import { createStreamFn } from "../utils/proxy-utils.js";
 import type { UserMessageWithAttachments } from "./Messages.js";
 import type { StreamingMessageContainer } from "./StreamingMessageContainer.js";
 
-@customElement("agent-interface")
 export class AgentInterface extends LitElement {
 	// Optional external session: when provided, this component becomes a view over the session
 	@property({ attribute: false }) session?: Agent;
