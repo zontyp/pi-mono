@@ -258,6 +258,11 @@ export class AgentInterface extends LitElement {
 		} else {
 			await this.session?.prompt(input);
 		}
+
+		// Agent.finishRun() clears isStreaming after the last event (agent_end),
+		// but no event fires after that, so trigger a re-render to pick up
+		// the final state (isStreaming: false, final messages).
+		this.requestUpdate();
 	}
 
 	private renderMessages() {
