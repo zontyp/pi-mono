@@ -169,7 +169,7 @@ Available tools:
 - Artifacts: Create interactive HTML, SVG, Markdown, and text artifacts
 
 Feel free to use these tools when needed to provide accurate and helpful responses.`,
-			model: getModel("anthropic", "claude-sonnet-4-5-20250929"),
+			model: getModel("openai", "gpt-4o"),
 			thinkingLevel: "off",
 			messages: [],
 			tools: [],
@@ -179,8 +179,11 @@ Feel free to use these tools when needed to provide accurate and helpful respons
 	});
 
 	agentUnsubscribe = agent.subscribe((event: any) => {
-		if (event.type === "state-update") {
-			const messages = event.state.messages;
+		// Save session on message_end and agent_end events.
+		// "state-update" doesn't exist in AgentEvent — the actual events are
+		// message_start, message_end, turn_start, turn_end, agent_start, agent_end, etc.
+		if (event.type === "message_end" || event.type === "agent_end") {
+			const messages = agent.state.messages;
 
 			// Generate title after first successful response
 			if (!currentTitle && shouldSaveSession(messages)) {
