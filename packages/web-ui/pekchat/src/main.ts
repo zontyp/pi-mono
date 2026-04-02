@@ -109,7 +109,10 @@ const saveSession = async () => {
 	if (!storage.sessions || !currentSessionId || !agent || !currentTitle) return;
 
 	const state = agent.state;
-	if (!shouldSaveSession(state.messages)) return;
+	// Save if there are any messages at all (including system notifications).
+	// The original check (shouldSaveSession) requires both user + assistant messages,
+	// but browser-use sessions start with just a notification message.
+	if (state.messages.length === 0) return;
 
 	try {
 		// Create session data
@@ -294,20 +297,26 @@ const renderApp = () => {
 								const sessionId = await createSession();
 								browserUseSessionId = sessionId;
 
-								// Show confirmation in chat by directly adding to messages.
-								// We can't use agent.steer() because it only queues messages
-								// that get drained on the next prompt/continue call.
-								// Instead, push directly into state.messages and re-render.
+								// Show confirmation in chat
 								if (agent) {
 									const notification = createSystemNotification(
 										`New session created - ${sessionId}`,
 									);
 									agent.state.messages = [...agent.state.messages, notification];
-									// Trigger re-render on the AgentInterface web component
-									// so message-list picks up the new message.
-									// renderApp() only re-renders the outer shell, not the
-									// Lit web component internals.
 									chatPanel.agentInterface?.requestUpdate();
+
+									// Persist session to IndexedDB so it survives page refresh.
+									// Set up currentSessionId + title if not already set,
+									// then save immediately.
+									if (!currentSessionId) {
+										currentSessionId = crypto.randomUUID();
+										updateUrl(currentSessionId);
+									}
+									if (!currentTitle) {
+										currentTitle = `Browser session ${sessionId}`;
+									}
+									await saveSession();
+									renderApp();
 								}
 							} catch (err) {
 								// Show error in chat if pekserve is unreachable
