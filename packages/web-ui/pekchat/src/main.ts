@@ -303,7 +303,11 @@ const renderApp = () => {
 										`New session created - ${sessionId}`,
 									);
 									agent.state.messages = [...agent.state.messages, notification];
-									renderApp();
+									// Trigger re-render on the AgentInterface web component
+									// so message-list picks up the new message.
+									// renderApp() only re-renders the outer shell, not the
+									// Lit web component internals.
+									chatPanel.agentInterface?.requestUpdate();
 								}
 							} catch (err) {
 								// Show error in chat if pekserve is unreachable
@@ -313,7 +317,7 @@ const renderApp = () => {
 										"destructive",
 									);
 									agent.state.messages = [...agent.state.messages, notification];
-									renderApp();
+									chatPanel.agentInterface?.requestUpdate();
 								}
 							}
 						},
