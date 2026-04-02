@@ -293,23 +293,26 @@ const renderApp = () => {
 								const sessionId = await createSession();
 								browserUseSessionId = sessionId;
 
-								// Show confirmation in chat
+								// Show confirmation in chat by directly adding to messages.
+								// We can't use agent.steer() because it only queues messages
+								// that get drained on the next prompt/continue call.
+								// Instead, push directly into state.messages and re-render.
 								if (agent) {
-									agent.steer(
-										createSystemNotification(
-											`New session created - ${sessionId}`,
-										),
+									const notification = createSystemNotification(
+										`New session created - ${sessionId}`,
 									);
+									agent.state.messages = [...agent.state.messages, notification];
+									renderApp();
 								}
 							} catch (err) {
 								// Show error in chat if pekserve is unreachable
 								if (agent) {
-									agent.steer(
-										createSystemNotification(
-											`Failed to create session: ${(err as Error).message}`,
-											"destructive",
-										),
+									const notification = createSystemNotification(
+										`Failed to create session: ${(err as Error).message}`,
+										"destructive",
 									);
+									agent.state.messages = [...agent.state.messages, notification];
+									renderApp();
 								}
 							}
 						},
