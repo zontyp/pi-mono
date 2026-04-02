@@ -286,6 +286,7 @@ const renderApp = () => {
 					${Button({
 						variant: "ghost",
 						size: "sm",
+						disabled: agent?.state?.isStreaming ?? false,
 						children: icon(Plus, "sm"),
 						onClick: async () => {
 							try {
