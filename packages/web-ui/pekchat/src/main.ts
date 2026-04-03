@@ -22,11 +22,11 @@ import {
 import { html, render } from "lit";
 import { Bell, History, Plus, Settings } from "lucide";
 import "./app.css";
-import { createSession } from "./api.js";
+import { createSession, sendTask } from "./api.js";
 import { icon } from "@mariozechner/mini-lit";
 import { Button } from "@mariozechner/mini-lit/dist/Button.js";
 import { Input } from "@mariozechner/mini-lit/dist/Input.js";
-import { createSystemNotification, customConvertToLlm, registerCustomMessageRenderers } from "./custom-messages.js";
+import { createBrowserTaskResult, createSystemNotification, customConvertToLlm, registerCustomMessageRenderers } from "./custom-messages.js";
 
 // Register custom message renderers
 registerCustomMessageRenderers();
@@ -72,7 +72,8 @@ let agentUnsubscribe: (() => void) | undefined;
 
 // Browser-use session ID from pekserve.
 // Different from currentSessionId which is the local IndexedDB session ID.
-// Will be used for task submission in the next phase.
+// Set when the user clicks '+' (createSession), persisted in IndexedDB,
+// and restored on page reload via loadSession().
 let browserUseSessionId: string | null = null;
 
 const generateTitle = (messages: AgentMessage[]): string => {
@@ -115,13 +116,17 @@ const saveSession = async () => {
 	if (state.messages.length === 0) return;
 
 	try {
-		// Create session data
+		// Create session data.
+		// browserUseSessionId is persisted so it survives page refresh.
+		// On reload, we restore it and can continue sending tasks to
+		// the same server-side session (if the server is still running).
 		const sessionData = {
 			id: currentSessionId,
 			title: currentTitle,
 			model: state.model!,
 			thinkingLevel: state.thinkingLevel,
 			messages: state.messages,
+			browserUseSessionId,
 			createdAt: new Date().toISOString(),
 			lastModified: new Date().toISOString(),
 		};
@@ -162,6 +167,54 @@ const updateUrl = (sessionId: string) => {
 	const url = new URL(window.location.href);
 	url.searchParams.set("session", sessionId);
 	window.history.replaceState({}, "", url);
+};
+
+// ---------------------------------------------------------------------------
+// extractTextFromPromptInput — pull plain text from agent.prompt() arguments
+// ---------------------------------------------------------------------------
+// agent.prompt() accepts multiple overloads:
+//   - prompt("hello")                    → string
+//   - prompt({ role: "user", content: "hello", ... })  → single AgentMessage
+//   - prompt([msg1, msg2])               → array of AgentMessage
+//
+// We need to extract the user's text regardless of which overload was used.
+// ---------------------------------------------------------------------------
+const extractTextFromPromptInput = (input: string | AgentMessage | AgentMessage[]): string => {
+	// Simple string — most common case (ChatPanel calls prompt("user text"))
+	if (typeof input === "string") {
+		return input;
+	}
+
+	// Array of messages — take text from the first user message
+	if (Array.isArray(input)) {
+		const firstUser = input.find((m) => m.role === "user");
+		if (firstUser && "content" in firstUser && typeof firstUser.content === "string") {
+			return firstUser.content;
+		}
+		// Fallback: stringify so we don't lose data silently
+		return JSON.stringify(input);
+	}
+
+	// Single AgentMessage object — check "content" exists
+	// (custom message types like SystemNotificationMessage don't have "content")
+	if ("content" in input) {
+		const content = (input as any).content;
+		if (typeof content === "string") {
+			return content;
+		}
+		// Content is an array of blocks (e.g. text + image) — extract text parts
+		if (Array.isArray(content)) {
+			const textParts = content
+				.filter((block: any) => block.type === "text")
+				.map((block: any) => block.text || "");
+			if (textParts.length > 0) {
+				return textParts.join(" ");
+			}
+		}
+	}
+
+	// Fallback
+	return JSON.stringify(input);
 };
 
 const createAgent = async (initialState?: Partial<AgentState>) => {
@@ -225,6 +278,107 @@ Feel free to use these tools when needed to provide accurate and helpful respons
 			return [replTool];
 		},
 	});
+
+	// ========================================================================
+	// OVERRIDE agent.prompt() — route all messages to browser-use via pekserve
+	// ========================================================================
+	//
+	// How it works:
+	//   1. ChatPanel → AgentInterface → sendMessage() calls agent.prompt(input)
+	//   2. Our override intercepts this call
+	//   3. Instead of sending to the LLM, we POST to pekserve /sessions/:id/tasks
+	//   4. We manually manage agent.state.messages and isStreaming
+	//
+	// Why override instead of modifying library code:
+	//   - Zero changes to MessageEditor, AgentInterface, or ChatPanel
+	//   - The entire ChatPanel UI (input, attachments, stop button) works as-is
+	//   - isStreaming=true makes the send arrow become a stop button automatically
+	//
+	// KNOWN LIMITATION:
+	//   AgentInterface.sendMessage() checks for an API key BEFORE calling
+	//   agent.prompt(). If no API key is configured for the model's provider
+	//   (e.g. OpenAI), it will show an API key dialog. The user must either:
+	//   - Enter any API key (it won't actually be used since we bypass the LLM)
+	//   - Or configure one in Settings beforehand
+	//   This is cosmetic — the LLM is never called regardless.
+	//
+	// ========================================================================
+
+	agent.prompt = async (input: string | AgentMessage | AgentMessage[]) => {
+		// --- Extract the text from whatever format agent.prompt() receives ---
+		// ChatPanel normally calls agent.prompt(string) or agent.prompt(message).
+		// We handle all overloads for safety.
+		const text = extractTextFromPromptInput(input);
+
+		// --- Guard: no browser-use session ---
+		if (!browserUseSessionId) {
+			const notification = createSystemNotification(
+				"No active session. Click '+' to create a browser-use session first.",
+				"destructive",
+			);
+			agent.state.messages = [...agent.state.messages, notification];
+			chatPanel.agentInterface?.requestUpdate();
+			return;
+		}
+
+		// --- Add user message to chat ---
+		agent.state.messages = [
+			...agent.state.messages,
+			{ role: "user" as const, content: text, timestamp: Date.now() },
+		];
+		chatPanel.agentInterface?.requestUpdate();
+
+		// --- Show loading state ---
+		// Setting isStreaming=true makes MessageEditor show the stop button
+		// instead of the send arrow, preventing double-sends.
+		// Cast needed because isStreaming is readonly on the public AgentState type,
+		// but we're intentionally bypassing the agent's run loop here.
+		(agent.state as any).isStreaming = true;
+		chatPanel.agentInterface?.requestUpdate();
+
+		try {
+			// --- Send task to pekserve ---
+			const response = await sendTask(browserUseSessionId, text);
+
+			// --- Add result to chat ---
+			const resultMessage = createBrowserTaskResult(
+				text,
+				response.result,
+				response.ok,
+				browserUseSessionId,
+			);
+			agent.state.messages = [...agent.state.messages, resultMessage];
+
+			// --- Title & session management (same logic as the agent subscriber) ---
+			if (!currentTitle) {
+				currentTitle = generateTitle(agent.state.messages);
+			}
+			if (!currentSessionId) {
+				currentSessionId = crypto.randomUUID();
+				updateUrl(currentSessionId);
+			}
+			if (currentSessionId) {
+				await saveSession();
+			}
+		} catch (err) {
+			// --- Show error in chat ---
+			// Common errors:
+			//   - Network error (pekserve down)
+			//   - 404 (server-side session expired / server restarted)
+			//   - 409 (task already running on this session)
+			//   - 500 (browser-use-api-server error)
+			const errorNotification = createSystemNotification(
+				`Browser task error: ${(err as Error).message}`,
+				"destructive",
+			);
+			agent.state.messages = [...agent.state.messages, errorNotification];
+		} finally {
+			// --- Restore send arrow ---
+			(agent.state as any).isStreaming = false;
+			chatPanel.agentInterface?.requestUpdate();
+			renderApp();
+		}
+	};
 };
 
 const loadSession = async (sessionId: string): Promise<boolean> => {
@@ -239,6 +393,11 @@ const loadSession = async (sessionId: string): Promise<boolean> => {
 	currentSessionId = sessionId;
 	const metadata = await storage.sessions.getMetadata(sessionId);
 	currentTitle = metadata?.title || "";
+
+	// Restore the browser-use session ID so the user can continue sending
+	// tasks without clicking '+' again. If the server-side session is gone
+	// (e.g. server restarted), sendTask() will return 404 and we show an error.
+	browserUseSessionId = (sessionData as any).browserUseSessionId || null;
 
 	await createAgent({
 		model: sessionData.model,

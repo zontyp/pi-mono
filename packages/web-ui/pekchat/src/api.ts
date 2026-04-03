@@ -4,8 +4,9 @@
 // Talks to pekserve (Hono proxy on port 3000) which proxies to
 // browser-use-api-server (FastAPI on port 8000).
 //
-// For now, only createSession() is implemented.
-// sendTask(), deleteSession(), listSessions() will be added later.
+// Currently implements:
+//   - createSession() — create a new browser-use session
+//   - sendTask()      — send a task (user message) to a session
 // ============================================================================
 
 const PEKSERVE_URL = "http://localhost:3000";
@@ -28,7 +29,40 @@ export async function createSession(): Promise<string> {
   return data.session_id;
 }
 
+// ---------------------------------------------------------------------------
+// sendTask — send a browser-use task to an existing session
+// ---------------------------------------------------------------------------
+// The user's chat message becomes the "task" string. browser-use-api-server
+// decides whether it's the first task (creates a new Agent) or a follow-up
+// (reuses the Agent with conversation history).
+//
+// Returns { ok: true, result: "..." } on success.
+// Throws on network errors, 404 (session gone), 409 (task already running).
+// ---------------------------------------------------------------------------
+
+export interface SendTaskResponse {
+  ok: boolean;
+  result: string;
+}
+
+export async function sendTask(
+  sessionId: string,
+  task: string,
+): Promise<SendTaskResponse> {
+  const res = await fetch(`${PEKSERVE_URL}/sessions/${sessionId}/tasks`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ task }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Task failed: ${res.status} ${err}`);
+  }
+
+  return await res.json();
+}
+
 // TODO: Add these in next phase
-// export async function sendTask(sessionId: string, task: string): Promise<{ ok: boolean; result: string }>
 // export async function deleteSession(sessionId: string): Promise<void>
 // export async function listSessions(): Promise<any[]>
