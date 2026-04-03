@@ -20,7 +20,7 @@ import {
 	setAppStorage,
 } from "@mariozechner/pi-web-ui";
 import { html, render } from "lit";
-import { Bell, History, Plus, Settings } from "lucide";
+import { History, Plus, Settings } from "lucide";
 import "./app.css";
 import { createSession, sendTaskStream, abortTask } from "./api.js";
 import { icon } from "@mariozechner/mini-lit";
