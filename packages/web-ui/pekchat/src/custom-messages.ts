@@ -1,18 +1,18 @@
-import { icon } from "@mariozechner/mini-lit";
 import { Alert } from "@mariozechner/mini-lit/dist/Alert.js";
 import type { Message } from "@mariozechner/pi-ai";
 import type { AgentMessage, MessageRenderer } from "@mariozechner/pi-web-ui";
 import { defaultConvertToLlm, registerMessageRenderer } from "@mariozechner/pi-web-ui";
 import { html } from "lit";
-import { Globe } from "lucide";
+import type { StepEvent, ResultEvent } from "./api.js";
 
 // ============================================================================
 // 1. CUSTOM MESSAGE TYPES (declaration merging with pi-agent-core)
 // ============================================================================
 //
-// We define two custom message types:
-//   - "system-notification"  — generic UI alerts (session created, errors, etc.)
-//   - "browser-task-result"  — result of a browser-use task sent via pekserve
+// We define three custom message types:
+//   - "system-notification"   — generic UI alerts (session created, errors, etc.)
+//   - "browser-use-step"      — one step of agent execution (SSE step event)
+//   - "browser-use-result"    — final result of a task (SSE result event)
 //
 // Declaration merging lets agent.state.messages accept these custom roles
 // alongside the standard "user" / "assistant" / "tool-result" roles.
@@ -27,35 +27,50 @@ export interface SystemNotificationMessage {
 	timestamp: string;
 }
 
-// --- Browser Task Result ---------------------------------------------------
-// Rendered with a Globe icon badge so the user can distinguish browser-use
-// responses from regular assistant messages.
+// --- Browser-Use Step ------------------------------------------------------
+// Represents one step of agent execution. The agent navigates, clicks,
+// types, etc. — each step produces one of these messages in the chat.
 
-export interface BrowserTaskResultMessage {
-	role: "browser-task-result";
-	task: string;       // the original user input that triggered this task
-	result: string;     // the text result returned by browser-use
-	ok: boolean;        // whether the task succeeded
-	sessionId: string;  // browser-use session ID (for display / debugging)
+export interface BrowserUseStepMessage {
+	role: "browser-use-step";
+	step: number;              // step number (1, 2, 3, ...)
+	url: string;               // current page URL
+	title: string;             // current page title
+	eval: string | null;       // agent's evaluation of previous goal
+	memory: string | null;     // agent's memory/notes
+	nextGoal: string | null;   // what the agent plans to do next
+	actions: Record<string, any>[]; // actions taken (e.g. [{click: {index: 5}}])
 	timestamp: string;
 }
 
-// Extend CustomAgentMessages interface via declaration merging.
+// --- Browser-Use Result ----------------------------------------------------
+// Final result of a task — success or failure.
+
+export interface BrowserUseResultMessage {
+	role: "browser-use-result";
+	ok: boolean;
+	result: string;
+	timestamp: string;
+}
+
+// Extend CustomAgentMessages via declaration merging.
 // This must target pi-agent-core where CustomAgentMessages is defined.
 declare module "@mariozechner/pi-agent-core" {
 	interface CustomAgentMessages {
 		"system-notification": SystemNotificationMessage;
-		"browser-task-result": BrowserTaskResultMessage;
+		"browser-use-step": BrowserUseStepMessage;
+		"browser-use-result": BrowserUseResultMessage;
 	}
 }
 
 // ============================================================================
-// 2. CREATE CUSTOM RENDERER (TYPED TO SystemNotificationMessage)
+// 2. RENDERERS
 // ============================================================================
+
+// --- System Notification Renderer ------------------------------------------
 
 const systemNotificationRenderer: MessageRenderer<SystemNotificationMessage> = {
 	render: (notification) => {
-		// notification is fully typed as SystemNotificationMessage!
 		return html`
 			<div class="px-4">
 				${Alert({
@@ -72,14 +87,52 @@ const systemNotificationRenderer: MessageRenderer<SystemNotificationMessage> = {
 	},
 };
 
-// ============================================================================
-// 2b. BROWSER TASK RESULT RENDERER
-// ============================================================================
-// Shows the result of a browser-use task with a Globe icon badge.
-// Green border (default variant) for success, red (destructive) for failure.
-// ============================================================================
+// --- Browser-Use Step Renderer ---------------------------------------------
+// Shows a card for each agent step:
+//   Step 1 • https://google.com
+//   ✅ Successfully navigated to page
+//   🎯 Type search query in search box
+//   ▶ navigate: {"url":"https://google.com"}
 
-const browserTaskResultRenderer: MessageRenderer<BrowserTaskResultMessage> = {
+const browserUseStepRenderer: MessageRenderer<BrowserUseStepMessage> = {
+	render: (msg) => {
+		// Format actions as human-readable strings.
+		// Each action is like { click: { index: 5 } } or { input: { index: 2, text: "hello" } }
+		// We show: "click: {"index":5}" — simple and debuggable.
+		const actionStrings = msg.actions.map((a) => {
+			const entries = Object.entries(a);
+			if (entries.length === 0) return "unknown action";
+			const [type, params] = entries[0];
+			return `${type}: ${JSON.stringify(params)}`;
+		});
+
+		return html`
+			<div class="px-4 py-1">
+				<div class="rounded-lg border border-border bg-card p-3 text-sm">
+					<!-- Header: step number + URL -->
+					<div class="flex items-center gap-2 text-muted-foreground mb-1">
+						<span class="font-mono font-bold">Step ${msg.step}</span>
+						<span>•</span>
+						<span class="truncate">${msg.url}</span>
+					</div>
+					<!-- Eval: how the agent judged the previous step -->
+					${msg.eval ? html`<div class="text-foreground">✅ ${msg.eval}</div>` : ""}
+					<!-- Next goal: what the agent plans to do -->
+					${msg.nextGoal ? html`<div class="text-muted-foreground">🎯 ${msg.nextGoal}</div>` : ""}
+					<!-- Actions: what the agent actually did -->
+					<div class="mt-1 text-xs text-muted-foreground">
+						${actionStrings.map((a) => html`<div class="font-mono">▶ ${a}</div>`)}
+					</div>
+				</div>
+			</div>
+		`;
+	},
+};
+
+// --- Browser-Use Result Renderer -------------------------------------------
+// Shows the final result with a success/failure indicator.
+
+const browserUseResultRenderer: MessageRenderer<BrowserUseResultMessage> = {
 	render: (msg) => {
 		return html`
 			<div class="px-4">
@@ -87,15 +140,8 @@ const browserTaskResultRenderer: MessageRenderer<BrowserTaskResultMessage> = {
 					variant: msg.ok ? "default" : "destructive",
 					children: html`
 						<div class="flex flex-col gap-1">
-							<!-- Header: Globe icon + label + session ID for debugging -->
-							<div class="flex items-center gap-2 text-xs font-medium opacity-70">
-								${icon(Globe, "sm")}
-								<span>Browser Task Result</span>
-								<span class="font-mono">[${msg.sessionId}]</span>
-							</div>
-							<!-- The actual result text from browser-use -->
+							<div class="font-semibold">${msg.ok ? "✅ Task completed" : "❌ Task failed"}</div>
 							<div class="whitespace-pre-wrap">${msg.result}</div>
-							<div class="text-xs opacity-70">${new Date(msg.timestamp).toLocaleTimeString()}</div>
 						</div>
 					`,
 				})}
@@ -110,13 +156,18 @@ const browserTaskResultRenderer: MessageRenderer<BrowserTaskResultMessage> = {
 
 export function registerCustomMessageRenderers() {
 	registerMessageRenderer("system-notification", systemNotificationRenderer);
-	registerMessageRenderer("browser-task-result", browserTaskResultRenderer);
+	registerMessageRenderer("browser-use-step", browserUseStepRenderer);
+	registerMessageRenderer("browser-use-result", browserUseResultRenderer);
 }
 
 // ============================================================================
-// 4. HELPER TO CREATE CUSTOM MESSAGES
+// 4. HELPER FUNCTIONS — create custom messages from SSE events
 // ============================================================================
 
+/**
+ * Create a system notification message for the chat.
+ * Used for: session created, errors, abort confirmation, etc.
+ */
 export function createSystemNotification(
 	message: string,
 	variant: "default" | "destructive" = "default",
@@ -130,25 +181,32 @@ export function createSystemNotification(
 }
 
 /**
- * Create a browser-task-result message for the chat.
- *
- * @param task   - the original user input (e.g. "Go to google.com")
- * @param result - the text result from browser-use
- * @param ok     - whether the task succeeded
- * @param sessionId - the browser-use session ID
+ * Create a browser-use step message from an SSE StepEvent.
+ * Called in main.ts when an onStep callback fires.
  */
-export function createBrowserTaskResult(
-	task: string,
-	result: string,
-	ok: boolean,
-	sessionId: string,
-): BrowserTaskResultMessage {
+export function createBrowserUseStep(data: StepEvent): BrowserUseStepMessage {
 	return {
-		role: "browser-task-result",
-		task,
-		result,
-		ok,
-		sessionId,
+		role: "browser-use-step",
+		step: data.step,
+		url: data.url,
+		title: data.title,
+		eval: data.eval,
+		memory: data.memory,
+		nextGoal: data.next_goal,  // snake_case from server → camelCase in UI
+		actions: data.actions,
+		timestamp: new Date().toISOString(),
+	};
+}
+
+/**
+ * Create a browser-use result message from an SSE ResultEvent.
+ * Called in main.ts when an onResult callback fires.
+ */
+export function createBrowserUseResult(data: ResultEvent): BrowserUseResultMessage {
+	return {
+		role: "browser-use-result",
+		ok: data.ok,
+		result: data.result,
 		timestamp: new Date().toISOString(),
 	};
 }
@@ -158,11 +216,15 @@ export function createBrowserTaskResult(
 // ============================================================================
 
 /**
- * Custom message transformer that extends defaultConvertToLlm.
+ * Convert custom message types to standard LLM-compatible messages.
  *
- * Converts our custom message types into standard user messages so the LLM
- * can understand them if the conversation is ever sent to an LLM.
- * (Currently all messages go to browser-use, but this keeps things future-proof.)
+ * This is needed because agent.state.messages can contain our custom types
+ * (system-notification, browser-use-step, browser-use-result) which the
+ * LLM doesn't understand. We convert them to plain user messages with
+ * XML-like tags so the LLM could understand them if needed.
+ *
+ * Currently all messages go to browser-use (not an LLM), so this is
+ * mainly for future-proofing and the pi-agent-core pipeline.
  */
 export function customConvertToLlm(messages: AgentMessage[]): Message[] {
 	const processed = messages.map((m): AgentMessage => {
@@ -176,12 +238,22 @@ export function customConvertToLlm(messages: AgentMessage[]): Message[] {
 			};
 		}
 
-		// Browser task results → user message with <browser-task-result> tags
-		if (m.role === "browser-task-result") {
-			const taskResult = m as BrowserTaskResultMessage;
+		// Browser-use steps → user message with <browser-step> tags
+		if (m.role === "browser-use-step") {
+			const step = m as BrowserUseStepMessage;
 			return {
 				role: "user",
-				content: `<browser-task-result session="${taskResult.sessionId}" ok="${taskResult.ok}">${taskResult.result}</browser-task-result>`,
+				content: `<browser-step step="${step.step}" url="${step.url}">${step.eval || ""}</browser-step>`,
+				timestamp: Date.now(),
+			};
+		}
+
+		// Browser-use results → user message with <browser-result> tags
+		if (m.role === "browser-use-result") {
+			const result = m as BrowserUseResultMessage;
+			return {
+				role: "user",
+				content: `<browser-result ok="${result.ok}">${result.result}</browser-result>`,
 				timestamp: Date.now(),
 			};
 		}

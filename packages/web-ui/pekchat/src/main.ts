@@ -22,22 +22,25 @@ import {
 import { html, render } from "lit";
 import { Bell, History, Plus, Settings } from "lucide";
 import "./app.css";
-import { createSession, sendTask } from "./api.js";
+import { createSession, sendTaskStream, abortTask } from "./api.js";
 import { icon } from "@mariozechner/mini-lit";
 import { Button } from "@mariozechner/mini-lit/dist/Button.js";
 import { Input } from "@mariozechner/mini-lit/dist/Input.js";
-import { createBrowserTaskResult, createSystemNotification, customConvertToLlm, registerCustomMessageRenderers } from "./custom-messages.js";
+import { createBrowserUseStep, createBrowserUseResult, createSystemNotification, customConvertToLlm, registerCustomMessageRenderers } from "./custom-messages.js";
 
-// Register custom message renderers
+// Register custom message renderers so the chat UI knows how to
+// display our custom message types (step cards, result alerts, etc.)
 registerCustomMessageRenderers();
 
-// Create stores
+// ============================================================================
+// STORES & BACKEND — IndexedDB persistence for sessions, settings, etc.
+// ============================================================================
+
 const settings = new SettingsStore();
 const providerKeys = new ProviderKeysStore();
 const sessions = new SessionsStore();
 const customProviders = new CustomProvidersStore();
 
-// Gather configs
 const configs = [
 	settings.getConfig(),
 	SessionsStore.getMetadataConfig(),
@@ -46,24 +49,25 @@ const configs = [
 	sessions.getConfig(),
 ];
 
-// Create backend
 const backend = new IndexedDBStorageBackend({
 	dbName: "pi-web-ui-example",
-	version: 2, // Incremented for custom-providers store
+	version: 2,
 	stores: configs,
 });
 
-// Wire backend to stores
 settings.setBackend(backend);
 providerKeys.setBackend(backend);
 customProviders.setBackend(backend);
 sessions.setBackend(backend);
 
-// Create and set app storage
 const storage = new AppStorage(settings, providerKeys, sessions, customProviders, backend);
 setAppStorage(storage);
 
-let currentSessionId: string | undefined;
+// ============================================================================
+// APP STATE
+// ============================================================================
+
+let currentSessionId: string | undefined;  // IndexedDB session ID (for persistence)
 let currentTitle = "";
 let isEditingTitle = false;
 let agent: Agent;
@@ -71,11 +75,21 @@ let chatPanel: ChatPanel;
 let agentUnsubscribe: (() => void) | undefined;
 
 // Browser-use session ID from pekserve.
-// Different from currentSessionId which is the local IndexedDB session ID.
-// Set when the user clicks '+' (createSession), persisted in IndexedDB,
-// and restored on page reload via loadSession().
+// Different from currentSessionId (IndexedDB). This is the server-side session
+// that holds the browser connection and agent state.
+// Set when user clicks '+', persisted in IndexedDB, restored on page reload.
 let browserUseSessionId: string | null = null;
 
+// AbortController for the current SSE stream.
+// Used by agent.stop() to cancel the fetch mid-stream when
+// the user clicks the stop button.
+let abortController: AbortController | null = null;
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+/** Generate a session title from the first user message (truncated to 50 chars) */
 const generateTitle = (messages: AgentMessage[]): string => {
 	const firstUserMsg = messages.find((m) => m.role === "user" || m.role === "user-with-attachments");
 	if (!firstUserMsg || (firstUserMsg.role !== "user" && firstUserMsg.role !== "user-with-attachments")) return "";
@@ -100,23 +114,21 @@ const generateTitle = (messages: AgentMessage[]): string => {
 	return text.length <= 50 ? text : `${text.substring(0, 47)}...`;
 };
 
+/** Check if session has enough messages to warrant saving (user + assistant) */
 const shouldSaveSession = (messages: AgentMessage[]): boolean => {
 	const hasUserMsg = messages.some((m: any) => m.role === "user" || m.role === "user-with-attachments");
 	const hasAssistantMsg = messages.some((m: any) => m.role === "assistant");
 	return hasUserMsg && hasAssistantMsg;
 };
 
+/** Save the current session to IndexedDB */
 const saveSession = async () => {
 	if (!storage.sessions || !currentSessionId || !agent || !currentTitle) return;
 
 	const state = agent.state;
-	// Save if there are any messages at all (including system notifications).
-	// The original check (shouldSaveSession) requires both user + assistant messages,
-	// but browser-use sessions start with just a notification message.
 	if (state.messages.length === 0) return;
 
 	try {
-		// Create session data.
 		// browserUseSessionId is persisted so it survives page refresh.
 		// On reload, we restore it and can continue sending tasks to
 		// the same server-side session (if the server is still running).
@@ -131,7 +143,6 @@ const saveSession = async () => {
 			lastModified: new Date().toISOString(),
 		};
 
-		// Create session metadata
 		const metadata = {
 			id: currentSessionId,
 			title: currentTitle,
@@ -139,18 +150,8 @@ const saveSession = async () => {
 			lastModified: sessionData.lastModified,
 			messageCount: state.messages.length,
 			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					total: 0,
-				},
+				input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			modelId: state.model?.id || null,
 			thinkingLevel: state.thinkingLevel,
@@ -163,6 +164,7 @@ const saveSession = async () => {
 	}
 };
 
+/** Update the URL with the session ID (for bookmarking / reload) */
 const updateUrl = (sessionId: string) => {
 	const url = new URL(window.location.href);
 	url.searchParams.set("session", sessionId);
@@ -191,18 +193,15 @@ const extractTextFromPromptInput = (input: string | AgentMessage | AgentMessage[
 		if (firstUser && "content" in firstUser && typeof firstUser.content === "string") {
 			return firstUser.content;
 		}
-		// Fallback: stringify so we don't lose data silently
 		return JSON.stringify(input);
 	}
 
-	// Single AgentMessage object — check "content" exists
-	// (custom message types like SystemNotificationMessage don't have "content")
+	// Single AgentMessage object
 	if ("content" in input) {
 		const content = (input as any).content;
 		if (typeof content === "string") {
 			return content;
 		}
-		// Content is an array of blocks (e.g. text + image) — extract text parts
 		if (Array.isArray(content)) {
 			const textParts = content
 				.filter((block: any) => block.type === "text")
@@ -213,9 +212,14 @@ const extractTextFromPromptInput = (input: string | AgentMessage | AgentMessage[
 		}
 	}
 
-	// Fallback
 	return JSON.stringify(input);
 };
+
+// ============================================================================
+// CREATE AGENT
+// ============================================================================
+// Sets up the pi-agent-core Agent instance and overrides agent.prompt()
+// and agent.stop() to route messages through browser-use SSE streaming.
 
 const createAgent = async (initialState?: Partial<AgentState>) => {
 	if (agentUnsubscribe) {
@@ -242,27 +246,19 @@ Feel free to use these tools when needed to provide accurate and helpful respons
 
 	agentUnsubscribe = agent.subscribe((event: any) => {
 		// Save session on message_end and agent_end events.
-		// "state-update" doesn't exist in AgentEvent — the actual events are
-		// message_start, message_end, turn_start, turn_end, agent_start, agent_end, etc.
 		if (event.type === "message_end" || event.type === "agent_end") {
 			const messages = agent.state.messages;
 
-			// Generate title after first successful response
 			if (!currentTitle && shouldSaveSession(messages)) {
 				currentTitle = generateTitle(messages);
 			}
-
-			// Create session ID on first successful save
 			if (!currentSessionId && shouldSaveSession(messages)) {
 				currentSessionId = crypto.randomUUID();
 				updateUrl(currentSessionId);
 			}
-
-			// Auto-save
 			if (currentSessionId) {
 				saveSession();
 			}
-
 			renderApp();
 		}
 	});
@@ -272,7 +268,6 @@ Feel free to use these tools when needed to provide accurate and helpful respons
 			return await ApiKeyPromptDialog.prompt(provider);
 		},
 		toolsFactory: (_agent, _agentInterface, _artifactsPanel, runtimeProvidersFactory) => {
-			// Create javascript_repl tool with access to attachments + artifacts
 			const replTool = createJavaScriptReplTool();
 			replTool.runtimeProvidersFactory = runtimeProvidersFactory;
 			return [replTool];
@@ -280,13 +275,13 @@ Feel free to use these tools when needed to provide accurate and helpful respons
 	});
 
 	// ========================================================================
-	// OVERRIDE agent.prompt() — route all messages to browser-use via pekserve
+	// OVERRIDE agent.prompt() — route messages to browser-use SSE stream
 	// ========================================================================
 	//
 	// How it works:
 	//   1. ChatPanel → AgentInterface → sendMessage() calls agent.prompt(input)
 	//   2. Our override intercepts this call
-	//   3. Instead of sending to the LLM, we POST to pekserve /sessions/:id/tasks
+	//   3. Instead of sending to the LLM, we stream via pekserve SSE
 	//   4. We manually manage agent.state.messages and isStreaming
 	//
 	// Why override instead of modifying library code:
@@ -296,18 +291,11 @@ Feel free to use these tools when needed to provide accurate and helpful respons
 	//
 	// KNOWN LIMITATION:
 	//   AgentInterface.sendMessage() checks for an API key BEFORE calling
-	//   agent.prompt(). If no API key is configured for the model's provider
-	//   (e.g. OpenAI), it will show an API key dialog. The user must either:
-	//   - Enter any API key (it won't actually be used since we bypass the LLM)
-	//   - Or configure one in Settings beforehand
-	//   This is cosmetic — the LLM is never called regardless.
-	//
+	//   agent.prompt(). If no API key is configured, it will show an API key
+	//   dialog. Enter any key — it won't be used since we bypass the LLM.
 	// ========================================================================
 
 	agent.prompt = async (input: string | AgentMessage | AgentMessage[]) => {
-		// --- Extract the text from whatever format agent.prompt() receives ---
-		// ChatPanel normally calls agent.prompt(string) or agent.prompt(message).
-		// We handle all overloads for safety.
 		const text = extractTextFromPromptInput(input);
 
 		// --- Guard: no browser-use session ---
@@ -328,28 +316,40 @@ Feel free to use these tools when needed to provide accurate and helpful respons
 		];
 		chatPanel.agentInterface?.requestUpdate();
 
-		// --- Show loading state ---
-		// Setting isStreaming=true makes MessageEditor show the stop button
-		// instead of the send arrow, preventing double-sends.
-		// Cast needed because isStreaming is readonly on the public AgentState type,
-		// but we're intentionally bypassing the agent's run loop here.
+		// --- Show loading state (stop button) ---
+		// isStreaming=true makes the send arrow become a stop button.
+		// Cast needed because isStreaming is readonly on public AgentState type.
 		(agent.state as any).isStreaming = true;
 		chatPanel.agentInterface?.requestUpdate();
 
+		// --- Create AbortController for this request ---
+		// agent.stop() will call abortController.abort() to cancel mid-stream
+		abortController = new AbortController();
+
 		try {
-			// --- Send task to pekserve ---
-			const response = await sendTask(browserUseSessionId, text);
+			// --- Stream task via SSE ---
+			await sendTaskStream(browserUseSessionId, text, {
+				onStep: (data) => {
+					// Each step becomes a card in the chat (real-time)
+					const stepMsg = createBrowserUseStep(data);
+					agent.state.messages = [...agent.state.messages, stepMsg];
+					chatPanel.agentInterface?.requestUpdate();
+				},
+				onResult: (data) => {
+					// Final result — success or failure alert
+					const resultMsg = createBrowserUseResult(data);
+					agent.state.messages = [...agent.state.messages, resultMsg];
+					chatPanel.agentInterface?.requestUpdate();
+				},
+				onError: (data) => {
+					// Server-side error — show as red notification
+					const errorMsg = createSystemNotification(data.error, "destructive");
+					agent.state.messages = [...agent.state.messages, errorMsg];
+					chatPanel.agentInterface?.requestUpdate();
+				},
+			}, abortController.signal);
 
-			// --- Add result to chat ---
-			const resultMessage = createBrowserTaskResult(
-				text,
-				response.result,
-				response.ok,
-				browserUseSessionId,
-			);
-			agent.state.messages = [...agent.state.messages, resultMessage];
-
-			// --- Title & session management (same logic as the agent subscriber) ---
+			// --- Title & session management ---
 			if (!currentTitle) {
 				currentTitle = generateTitle(agent.state.messages);
 			}
@@ -357,29 +357,65 @@ Feel free to use these tools when needed to provide accurate and helpful respons
 				currentSessionId = crypto.randomUUID();
 				updateUrl(currentSessionId);
 			}
-			if (currentSessionId) {
-				await saveSession();
-			}
 		} catch (err) {
-			// --- Show error in chat ---
-			// Common errors:
-			//   - Network error (pekserve down)
-			//   - 404 (server-side session expired / server restarted)
-			//   - 409 (task already running on this session)
-			//   - 500 (browser-use-api-server error)
-			const errorNotification = createSystemNotification(
-				`Browser task error: ${(err as Error).message}`,
-				"destructive",
-			);
-			agent.state.messages = [...agent.state.messages, errorNotification];
+			if ((err as Error).name === "AbortError") {
+				// User clicked stop button — not a real error.
+				// Show a friendly notification instead of a scary red alert.
+				const notification = createSystemNotification("Task aborted by user.");
+				agent.state.messages = [...agent.state.messages, notification];
+			} else {
+				// Real error: network failure, 404, 409, 500, etc.
+				const errorNotification = createSystemNotification(
+					`Browser task error: ${(err as Error).message}`,
+					"destructive",
+				);
+				agent.state.messages = [...agent.state.messages, errorNotification];
+			}
 		} finally {
-			// --- Restore send arrow ---
+			// --- Cleanup ---
+			abortController = null;
 			(agent.state as any).isStreaming = false;
 			chatPanel.agentInterface?.requestUpdate();
+			// Always save — even on abort, we want to preserve the steps received so far
+			await saveSession();
 			renderApp();
 		}
 	};
+
+	// ========================================================================
+	// OVERRIDE agent.abort() — abort SSE stream + server-side agent
+	// ========================================================================
+	// Called when the user clicks the stop button in the ChatPanel.
+	// Two things happen:
+	//   1. Client-side: abort the fetch (stops reading SSE events)
+	//   2. Server-side: call /abort endpoint (tells agent to stop at next step)
+	// ========================================================================
+
+	agent.abort = () => {
+		// Cancel the fetch stream (client-side)
+		if (abortController) {
+			abortController.abort();
+			abortController = null;
+		}
+
+		// Tell the server to stop the agent (server-side).
+		// Fire-and-forget — abort() is sync, so we can't await.
+		// The fetch abort already stopped the client; this just tells
+		// the server to stop the agent at the next step boundary.
+		if (browserUseSessionId) {
+			abortTask(browserUseSessionId).catch((err) => {
+				console.error("Abort request failed:", err);
+			});
+		}
+
+		(agent.state as any).isStreaming = false;
+		chatPanel.agentInterface?.requestUpdate();
+	};
 };
+
+// ============================================================================
+// LOAD SESSION — restore a session from IndexedDB
+// ============================================================================
 
 const loadSession = async (sessionId: string): Promise<boolean> => {
 	if (!storage.sessions) return false;
@@ -396,7 +432,7 @@ const loadSession = async (sessionId: string): Promise<boolean> => {
 
 	// Restore the browser-use session ID so the user can continue sending
 	// tasks without clicking '+' again. If the server-side session is gone
-	// (e.g. server restarted), sendTask() will return 404 and we show an error.
+	// (e.g. server restarted), sendTaskStream() will return 404 and we show an error.
 	browserUseSessionId = (sessionData as any).browserUseSessionId || null;
 
 	await createAgent({
@@ -411,6 +447,7 @@ const loadSession = async (sessionId: string): Promise<boolean> => {
 	return true;
 };
 
+/** Navigate to a fresh session (clears URL params and reloads) */
 const newSession = () => {
 	const url = new URL(window.location.href);
 	url.search = "";
@@ -429,6 +466,7 @@ const renderApp = () => {
 			<!-- Header -->
 			<div class="flex items-center justify-between border-b border-border shrink-0">
 				<div class="flex items-center gap-2 px-4 py-">
+					<!-- Sessions list button -->
 					${Button({
 						variant: "ghost",
 						size: "sm",
@@ -439,7 +477,6 @@ const renderApp = () => {
 									await loadSession(sessionId);
 								},
 								(deletedSessionId) => {
-									// Only reload if the current session was deleted
 									if (deletedSessionId === currentSessionId) {
 										newSession();
 									}
@@ -448,6 +485,8 @@ const renderApp = () => {
 						},
 						title: "Sessions",
 					})}
+
+					<!-- New browser-use session button -->
 					${Button({
 						variant: "ghost",
 						size: "sm",
@@ -467,9 +506,7 @@ const renderApp = () => {
 									agent.state.messages = [...agent.state.messages, notification];
 									chatPanel.agentInterface?.requestUpdate();
 
-									// Persist session to IndexedDB so it survives page refresh.
-									// Set up currentSessionId + title if not already set,
-									// then save immediately.
+									// Persist to IndexedDB immediately
 									if (!currentSessionId) {
 										currentSessionId = crypto.randomUUID();
 										updateUrl(currentSessionId);
@@ -481,7 +518,7 @@ const renderApp = () => {
 									renderApp();
 								}
 							} catch (err) {
-								// Show error in chat if pekserve is unreachable
+								// Show error if pekserve is unreachable
 								if (agent) {
 									const notification = createSystemNotification(
 										`Failed to create session: ${(err as Error).message}`,
@@ -495,6 +532,7 @@ const renderApp = () => {
 						title: "New Session",
 					})}
 
+					<!-- Session title (editable) -->
 					${
 						currentTitle
 							? isEditingTitle
@@ -545,26 +583,10 @@ const renderApp = () => {
 								>
 									${currentTitle}
 								</button>`
-							: html`<span class="text-base font-semibold text-foreground">Pi Web UI Example</span>`
+							: html`<span class="text-base font-semibold text-foreground">Pekchat</span>`
 					}
 				</div>
 				<div class="flex items-center gap-1 px-2">
-					${Button({
-						variant: "ghost",
-						size: "sm",
-						children: icon(Bell, "sm"),
-						onClick: () => {
-							// Demo: Inject custom message (will appear on next agent run)
-							if (agent) {
-								agent.steer(
-									createSystemNotification(
-										"This is a custom message! It appears in the UI but is never sent to the LLM.",
-									),
-								);
-							}
-						},
-						title: "Demo: Add Custom Notification",
-					})}
 					<theme-toggle></theme-toggle>
 					${Button({
 						variant: "ghost",
@@ -601,12 +623,6 @@ async function initApp() {
 		app,
 	);
 
-	// TODO: Fix PersistentStorageDialog - currently broken
-	// Request persistent storage
-	// if (storage.sessions) {
-	// 	await PersistentStorageDialog.request();
-	// }
-
 	// Create ChatPanel
 	chatPanel = new ChatPanel();
 
@@ -617,7 +633,6 @@ async function initApp() {
 	if (sessionIdFromUrl) {
 		const loaded = await loadSession(sessionIdFromUrl);
 		if (!loaded) {
-			// Session doesn't exist, redirect to new session
 			newSession();
 			return;
 		}
