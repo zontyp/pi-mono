@@ -1,68 +1,64 @@
 // ============================================================================
-// pekserve API client
+// pekserve API client — fastpekzho override
 // ============================================================================
-// Talks to pekserve (Hono proxy on port 3000) which proxies to
-// browser-use-api-server (FastAPI on port 8000).
+// Same-origin: the PekChat SPA and its pekserve API are served by ONE Hono
+// process (behind Caddy), so the base URL is relative ("").
 //
-// Currently implements:
-//   - createSession() — create a new browser-use session
-//   - sendTask()      — send a task (user message) to a session
+//   createSession(model) → POST /sessions { model }            → session_id
+//   sendTask(id, task)   → POST /sessions/:id/tasks { task }   → { ok, result, model }
+//
+// Each session is bound server-side to a model ("glm" | "deepseek"), so the
+// model is chosen once at session-creation time and every task on that session
+// goes to the same warm agent.
 // ============================================================================
 
-const PEKSERVE_URL = "http://localhost:3000";
+const PEKSERVE_URL = "";
 
 /**
- * Create a new browser-use session.
- * Returns the session_id from browser-use-api-server.
- *
- * POST /sessions → { session_id: "abc123" }
+ * Create a new conversation bound to a model.
+ * @param model "glm" | "deepseek" — which warm agent should own this session.
+ * POST /sessions { model } → { session_id, model }
  */
-export async function createSession(): Promise<string> {
-  const res = await fetch(`${PEKSERVE_URL}/sessions`, { method: "POST" });
+export async function createSession(model: string): Promise<string> {
+	const res = await fetch(`${PEKSERVE_URL}/sessions`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ model }),
+	});
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Failed to create session: ${res.status} ${err}`);
-  }
+	if (!res.ok) {
+		const err = await res.text();
+		throw new Error(`Failed to create session: ${res.status} ${err}`);
+	}
 
-  const data = await res.json();
-  return data.session_id;
+	const data = await res.json();
+	return data.session_id;
 }
-
-// ---------------------------------------------------------------------------
-// sendTask — send a browser-use task to an existing session
-// ---------------------------------------------------------------------------
-// The user's chat message becomes the "task" string. browser-use-api-server
-// decides whether it's the first task (creates a new Agent) or a follow-up
-// (reuses the Agent with conversation history).
-//
-// Returns { ok: true, result: "..." } on success.
-// Throws on network errors, 404 (session gone), 409 (task already running).
-// ---------------------------------------------------------------------------
 
 export interface SendTaskResponse {
-  ok: boolean;
-  result: string;
+	ok: boolean;
+	result: string;
+	model?: string; // human label of the model that produced this reply
 }
 
+/**
+ * Send the user's message to an existing (model-bound) session.
+ * Throws on network errors, 404 (session gone), 409 (task already running).
+ */
 export async function sendTask(
-  sessionId: string,
-  task: string,
+	sessionId: string,
+	task: string,
 ): Promise<SendTaskResponse> {
-  const res = await fetch(`${PEKSERVE_URL}/sessions/${sessionId}/tasks`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ task }),
-  });
+	const res = await fetch(`${PEKSERVE_URL}/sessions/${sessionId}/tasks`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ task }),
+	});
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Task failed: ${res.status} ${err}`);
-  }
+	if (!res.ok) {
+		const err = await res.text();
+		throw new Error(`Task failed: ${res.status} ${err}`);
+	}
 
-  return await res.json();
+	return await res.json();
 }
-
-// TODO: Add these in next phase
-// export async function deleteSession(sessionId: string): Promise<void>
-// export async function listSessions(): Promise<any[]>

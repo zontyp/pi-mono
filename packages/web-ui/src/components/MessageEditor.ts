@@ -1,3 +1,17 @@
+// ============================================================================
+// 🩹 fastpekzho VENDORED OVERRIDE of @mariozechner/pi-web-ui's MessageEditor.ts
+// ----------------------------------------------------------------------------
+// This is a verbatim copy of the upstream component (from zontyp/pi-mono @ pekchat)
+// with exactly ONE change: the chat-input model SELECTOR (a clickable <Button>
+// that opened the model-picker dialog) is now a non-clickable <span> LABEL —
+// search this file for `select-none` to find it (~L355). The label shows the
+// ✨ icon + currentModel.id, which main.ts sets to the friendly lane name
+// ("GLM 5.2" / "DeepSeek V4 Flash"), so it follows the left-column selection.
+//
+// The Dockerfile COPYs this over packages/web-ui/src/components/MessageEditor.ts
+// BEFORE pi-web-ui is built. If you bump the pinned PekChat/pi-web-ui version,
+// re-vendor this file from the new clone and re-apply the one-line change.
+// ============================================================================
 import { icon } from "@mariozechner/mini-lit";
 import { Button } from "@mariozechner/mini-lit/dist/Button.js";
 import { Select, type SelectOption } from "@mariozechner/mini-lit/dist/Select.js";
@@ -352,23 +366,7 @@ export class MessageEditor extends LitElement {
 						${
 							this.showModelSelector && this.currentModel
 								? html`
-									${Button({
-										variant: "ghost",
-										size: "sm",
-										onClick: () => {
-											// Focus textarea before opening model selector so focus returns there
-											this.textareaRef.value?.focus();
-											// Wait for next frame to ensure focus takes effect before dialog captures it
-											requestAnimationFrame(() => {
-												this.onModelSelect?.();
-											});
-										},
-										children: html`
-											${icon(Sparkles, "sm")}
-											<span class="ml-1">${this.currentModel.id}</span>
-										`,
-										className: "h-8 text-xs truncate",
-									})}
+									<span class="text-xs flex items-center px-2 opacity-70 select-none">${icon(Sparkles, "sm")}<span class="ml-1">${this.currentModel.id}</span></span>
 								`
 								: ""
 						}

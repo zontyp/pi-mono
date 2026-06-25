@@ -1,22 +1,20 @@
-import { icon } from "@mariozechner/mini-lit";
+// ============================================================================
+// fastpekzho override — custom chat message types + renderers
+// ============================================================================
+// Two custom message roles flow through agent.state.messages:
+//   - "system-notification" — generic UI alerts (session errors, etc.)
+//   - "browser-task-result" — a reply produced by a warm pi agent via pekserve
+//
+// We keep the upstream "browser-task-result" role name (so the renderer plumbing
+// is unchanged), but it now carries the responding model's LABEL instead of a
+// browser session id, and the bubble shows that label in its bottom-right corner.
+// ============================================================================
+
 import { Alert } from "@mariozechner/mini-lit/dist/Alert.js";
 import type { Message } from "@mariozechner/pi-ai";
 import type { AgentMessage, MessageRenderer } from "@mariozechner/pi-web-ui";
 import { defaultConvertToLlm, registerMessageRenderer } from "@mariozechner/pi-web-ui";
 import { html } from "lit";
-import { Globe } from "lucide";
-
-// ============================================================================
-// 1. CUSTOM MESSAGE TYPES (declaration merging with pi-agent-core)
-// ============================================================================
-//
-// We define two custom message types:
-//   - "system-notification"  — generic UI alerts (session created, errors, etc.)
-//   - "browser-task-result"  — result of a browser-use task sent via pekserve
-//
-// Declaration merging lets agent.state.messages accept these custom roles
-// alongside the standard "user" / "assistant" / "tool-result" roles.
-// ============================================================================
 
 // --- System Notification ---------------------------------------------------
 
@@ -27,21 +25,19 @@ export interface SystemNotificationMessage {
 	timestamp: string;
 }
 
-// --- Browser Task Result ---------------------------------------------------
-// Rendered with a Globe icon badge so the user can distinguish browser-use
-// responses from regular assistant messages.
+// --- Model Reply ------------------------------------------------------------
+// `model` is the human label (e.g. "GLM 5.2" / "DeepSeek V4 Flash") shown
+// bottom-right so the user always knows who answered.
 
 export interface BrowserTaskResultMessage {
 	role: "browser-task-result";
-	task: string;       // the original user input that triggered this task
-	result: string;     // the text result returned by browser-use
-	ok: boolean;        // whether the task succeeded
-	sessionId: string;  // browser-use session ID (for display / debugging)
+	task: string; // the original user input that triggered this reply
+	result: string; // the assistant's text
+	ok: boolean; // whether the call succeeded
+	model: string; // human label of the responding model
 	timestamp: string;
 }
 
-// Extend CustomAgentMessages interface via declaration merging.
-// This must target pi-agent-core where CustomAgentMessages is defined.
 declare module "@mariozechner/pi-agent-core" {
 	interface CustomAgentMessages {
 		"system-notification": SystemNotificationMessage;
@@ -49,13 +45,10 @@ declare module "@mariozechner/pi-agent-core" {
 	}
 }
 
-// ============================================================================
-// 2. CREATE CUSTOM RENDERER (TYPED TO SystemNotificationMessage)
-// ============================================================================
+// ── Renderers ────────────────────────────────────────────────────────────────
 
 const systemNotificationRenderer: MessageRenderer<SystemNotificationMessage> = {
 	render: (notification) => {
-		// notification is fully typed as SystemNotificationMessage!
 		return html`
 			<div class="px-4">
 				${Alert({
@@ -72,13 +65,7 @@ const systemNotificationRenderer: MessageRenderer<SystemNotificationMessage> = {
 	},
 };
 
-// ============================================================================
-// 2b. BROWSER TASK RESULT RENDERER
-// ============================================================================
-// Shows the result of a browser-use task with a Globe icon badge.
-// Green border (default variant) for success, red (destructive) for failure.
-// ============================================================================
-
+// 💬 A model reply: just the text, with timestamp (left) + model name (right).
 const browserTaskResultRenderer: MessageRenderer<BrowserTaskResultMessage> = {
 	render: (msg) => {
 		return html`
@@ -87,15 +74,12 @@ const browserTaskResultRenderer: MessageRenderer<BrowserTaskResultMessage> = {
 					variant: msg.ok ? "default" : "destructive",
 					children: html`
 						<div class="flex flex-col gap-1">
-							<!-- Header: Globe icon + label + session ID for debugging -->
-							<div class="flex items-center gap-2 text-xs font-medium opacity-70">
-								${icon(Globe, "sm")}
-								<span>Browser Task Result</span>
-								<span class="font-mono">[${msg.sessionId}]</span>
-							</div>
-							<!-- The actual result text from browser-use -->
 							<div class="whitespace-pre-wrap">${msg.result}</div>
-							<div class="text-xs opacity-70">${new Date(msg.timestamp).toLocaleTimeString()}</div>
+							<!-- Bottom-left, stacked: timestamp on top, model name below it. -->
+							<div class="flex flex-col text-xs opacity-70">
+								<span>${new Date(msg.timestamp).toLocaleTimeString()}</span>
+								<span class="font-mono">${msg.model}</span>
+							</div>
 						</div>
 					`,
 				})}
@@ -104,18 +88,12 @@ const browserTaskResultRenderer: MessageRenderer<BrowserTaskResultMessage> = {
 	},
 };
 
-// ============================================================================
-// 3. REGISTER RENDERERS
-// ============================================================================
-
 export function registerCustomMessageRenderers() {
 	registerMessageRenderer("system-notification", systemNotificationRenderer);
 	registerMessageRenderer("browser-task-result", browserTaskResultRenderer);
 }
 
-// ============================================================================
-// 4. HELPER TO CREATE CUSTOM MESSAGES
-// ============================================================================
+// ── Helpers to mint custom messages ──────────────────────────────────────────
 
 export function createSystemNotification(
 	message: string,
@@ -129,44 +107,27 @@ export function createSystemNotification(
 	};
 }
 
-/**
- * Create a browser-task-result message for the chat.
- *
- * @param task   - the original user input (e.g. "Go to google.com")
- * @param result - the text result from browser-use
- * @param ok     - whether the task succeeded
- * @param sessionId - the browser-use session ID
- */
+/** Create a model-reply message for the chat. */
 export function createBrowserTaskResult(
 	task: string,
 	result: string,
 	ok: boolean,
-	sessionId: string,
+	model: string,
 ): BrowserTaskResultMessage {
 	return {
 		role: "browser-task-result",
 		task,
 		result,
 		ok,
-		sessionId,
+		model,
 		timestamp: new Date().toISOString(),
 	};
 }
 
-// ============================================================================
-// 5. CUSTOM MESSAGE TRANSFORMER
-// ============================================================================
+// ── Custom → LLM transformer (future-proofing; LLM is server-side today) ──────
 
-/**
- * Custom message transformer that extends defaultConvertToLlm.
- *
- * Converts our custom message types into standard user messages so the LLM
- * can understand them if the conversation is ever sent to an LLM.
- * (Currently all messages go to browser-use, but this keeps things future-proof.)
- */
 export function customConvertToLlm(messages: AgentMessage[]): Message[] {
 	const processed = messages.map((m): AgentMessage => {
-		// System notifications → user message with <system> tags
 		if (m.role === "system-notification") {
 			const notification = m as SystemNotificationMessage;
 			return {
@@ -175,17 +136,14 @@ export function customConvertToLlm(messages: AgentMessage[]): Message[] {
 				timestamp: Date.now(),
 			};
 		}
-
-		// Browser task results → user message with <browser-task-result> tags
 		if (m.role === "browser-task-result") {
-			const taskResult = m as BrowserTaskResultMessage;
+			const reply = m as BrowserTaskResultMessage;
 			return {
 				role: "user",
-				content: `<browser-task-result session="${taskResult.sessionId}" ok="${taskResult.ok}">${taskResult.result}</browser-task-result>`,
+				content: `<model-reply model="${reply.model}" ok="${reply.ok}">${reply.result}</model-reply>`,
 				timestamp: Date.now(),
 			};
 		}
-
 		return m;
 	});
 
